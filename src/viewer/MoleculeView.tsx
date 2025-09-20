@@ -1,6 +1,6 @@
-import { Suspense, useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState, useRef } from "react";
 import { Canvas } from "@react-three/fiber";
-import { OrbitControls, AdaptiveDpr, Preload, Bounds } from "@react-three/drei";
+import { OrbitControls, AdaptiveDpr, Preload, Bounds, useBounds } from "@react-three/drei";
 import { Leva, useControls } from "leva";
 import type { InstancedMesh, LineSegments, Material } from "three";
 import { useMolScene } from "./useMolScene";
@@ -14,10 +14,6 @@ type SceneBuildOptions = {
 };
 
 function useSceneObjects(scene: MolScene | null, opts: SceneBuildOptions) {
-  /* const atomsKey = opts.atoms ? `${opts.atoms.sphereDetail}-${opts.atoms.materialKind}` : "off";
-  const bondsKey = opts.bonds ? "on" : "off";
-  const backboneKey = opts.backbone ? `${opts.backbone.color ?? "default"}` : "off"; */
-
   const objects = useMemo(() => {
     if (!scene) return { atoms: undefined as InstancedMesh | undefined, bonds: undefined as LineSegments | undefined, backbone: undefined as LineSegments | undefined };
 
@@ -95,6 +91,18 @@ export function MoleculeView() {
     document.body.style.background = renderOpts.background;
   }, [renderOpts.background]);
 
+  // Fit camera once after scene content mounts (no ongoing observe)
+  const api = useBounds();
+  const did = useRef(false);
+  useEffect(() => {
+    if (did.current) return;
+    const t = setTimeout(() => {
+      try { api.refresh().fit(); } catch { /* ignore initial fit errors */ }
+      did.current = true;
+    }, 0);
+    return () => clearTimeout(t);
+  }, [api]);
+
   return (
     <div style={{ display: 'flex', height: '100%', flex: 1 }}>
       <Leva collapsed={false} oneLineLabels hideCopyButton />
@@ -113,13 +121,13 @@ export function MoleculeView() {
         camera={{ position: [0, 0, 100], near: 0.1, far: 5000 }}
       >
         <color attach="background" args={[renderOpts.background]} />
-        <ambientLight intensity={0.8} />
+        <ambientLight intensity={1.0} />
         <directionalLight position={[5, 10, 5]} intensity={1.0} />
         <OrbitControls enableDamping dampingFactor={0.1} makeDefault />
         <AdaptiveDpr pixelated />
         <Preload all />
         <Suspense fallback={null}>
-          <Bounds fit clip observe margin={1.0}>
+          <Bounds fit clip margin={1.0}>
             {objects.atoms && <primitive object={objects.atoms} />}
             {objects.bonds && <primitive object={objects.bonds} />}
             {objects.backbone && <primitive object={objects.backbone} />}
