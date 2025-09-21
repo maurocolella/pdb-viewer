@@ -1,12 +1,12 @@
 import { Suspense, useEffect, useMemo, useState, useRef } from "react";
 import { Canvas } from "@react-three/fiber";
-import { OrbitControls, AdaptiveDpr, Preload, Bounds, useBounds } from "@react-three/drei";
+import { OrbitControls, AdaptiveDpr, Preload } from "@react-three/drei";
 import { Leva, useControls } from "leva";
-import type { InstancedMesh, LineSegments, Material } from "three";
+import type { InstancedMesh as InstancedMeshType, LineSegments, Material } from "three";
 import { useMolScene } from "./useMolScene";
 import { makeAtomsMesh, makeBondLines, makeBackboneLines, makeRibbonMesh, makeFlatRibbonMesh } from "pdb-parser";
 import type { ParseOptions, MolScene, AtomMeshOptions, BackboneLineOptions } from "pdb-parser";
-import { Mesh, Group, BufferGeometry } from "three";
+import { Vector3, Mesh } from "three";
 
 type SceneBuildOptions = {
   atoms: AtomMeshOptions | false;
@@ -16,9 +16,9 @@ type SceneBuildOptions = {
 
 function useSceneObjects(scene: MolScene | null, opts: SceneBuildOptions) {
   const objects = useMemo(() => {
-    if (!scene) return { atoms: undefined as InstancedMesh | undefined, bonds: undefined as LineSegments | undefined, backbone: undefined as LineSegments | undefined };
+    if (!scene) return { atoms: undefined as InstancedMeshType | undefined, bonds: undefined as LineSegments | undefined, backbone: undefined as LineSegments | undefined };
 
-    let atoms: InstancedMesh | undefined;
+    let atoms: InstancedMeshType | undefined;
     let bonds: LineSegments | undefined;
     let backbone: LineSegments | undefined;
 
@@ -120,8 +120,8 @@ export function MoleculeView() {
     backbone: overlays.backbone && common.representation === "spheres" ? {} : false,
   });
 
-  // Build cartoon (ribbon) group only when selected
-  const cartoon = useMemo(() => {
+  // Build ribbon group only when selected
+  const ribbonGroup = useMemo(() => {
     if (!scene) return null;
     if (common.representation === "ribbon-tube") {
       return makeRibbonMesh(scene, {
@@ -145,11 +145,11 @@ export function MoleculeView() {
     return null;
   }, [scene, common.representation, common.materialKind, ribbon.thickness]);
 
-  // Dispose cartoon on change/unmount
+  // Dispose ribbon on change/unmount
   useEffect(() => {
     return () => {
-      if (!cartoon) return;
-      cartoon.traverse((obj) => {
+      if (!ribbonGroup) return;
+      ribbonGroup.traverse((obj) => {
         if (obj instanceof Mesh) {
           // geometry is BufferGeometry on Mesh
           obj.geometry.dispose();
@@ -159,64 +159,77 @@ export function MoleculeView() {
         }
       });
     };
-  }, [cartoon]);
+  }, [ribbonGroup]);
 
   useEffect(() => {
     document.body.style.background = common.background;
   }, [common.background]);
+  
+  // OrbitControls ref (minimal shape we need)
+  type ControlsRef = {
+    target: Vector3;
+    object: { position: Vector3; fov?: number; updateProjectionMatrix?: () => void };
+    update: () => void;
+  };
+  const controlsRef = useRef<ControlsRef | null>(null);
 
-  // Fit camera once after scene content mounts (no ongoing observe)
-  const api = useBounds();
-  const did = useRef(false);
-  const contentRef = useRef<Group | null>(null);
+  // On new scene load: center and frame the model (compute distance from bbox/atoms)
+  const lastSceneRef = useRef<MolScene | null>(null);
   useEffect(() => {
-    if (did.current) return;
-    const t = setTimeout(() => {
-      try { api.refresh().fit(); } catch { /* ignore initial fit errors */ }
-      did.current = true;
-    }, 0);
-    return () => clearTimeout(t);
-  }, [api]);
-
-  // Re-center only when a new sourceUrl is loaded (do not react to Leva changes)
-  const lastFittedSource = useRef<string | null>(null);
-  useEffect(() => {
-    if (!scene || loading) return; // wait until parsing finishes
-    if (lastFittedSource.current === sourceUrl) return;
-    let raf1 = 0, raf2 = 0, raf3 = 0;
-    const doFit = () => {
-      try {
-        const root = contentRef.current;
-        if (root) {
-          // Ensure children exist before measuring
-          if (root.children.length === 0) {
-            raf3 = requestAnimationFrame(doFit);
-            return;
-          }
-          root.traverse((obj) => {
-            if (obj instanceof Mesh) {
-              const g = obj.geometry as BufferGeometry;
-              g.computeBoundingBox();
-              g.computeBoundingSphere();
-            }
-          });
-          api.refresh(root).fit();
-        } else {
-          api.refresh().fit();
+    if (!scene || loading) return;
+    if (lastSceneRef.current === scene) return;
+    if (!controlsRef.current) {
+      lastSceneRef.current = scene;
+      return;
+    }
+    // Compute center/size from bbox if present, else from atom positions
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    if (scene.bbox) {
+      [minX, minY, minZ] = scene.bbox.min;
+      [maxX, maxY, maxZ] = scene.bbox.max;
+    } else {
+      const a = scene.atoms;
+      if (a && a.count > 0) {
+        const p = a.positions;
+        for (let i = 0; i < a.count; i++) {
+          const x = p[i * 3], y = p[i * 3 + 1], z = p[i * 3 + 2];
+          if (x < minX) minX = x; if (y < minY) minY = y; if (z < minZ) minZ = z;
+          if (x > maxX) maxX = x; if (y > maxY) maxY = y; if (z > maxZ) maxZ = z;
         }
-        lastFittedSource.current = sourceUrl;
-      } catch { /* ignore fit errors on model swap */ }
-    };
-    // Double-RAF to wait for commit, plus a child-presence check above
-    raf1 = requestAnimationFrame(() => {
-      raf2 = requestAnimationFrame(doFit);
-    });
-    return () => {
-      if (raf1) cancelAnimationFrame(raf1);
-      if (raf2) cancelAnimationFrame(raf2);
-      if (raf3) cancelAnimationFrame(raf3);
-    };
-  }, [scene, sourceUrl, loading, api]);
+      }
+    }
+    if (!Number.isFinite(minX) || !Number.isFinite(maxX)) {
+      lastSceneRef.current = scene;
+      return;
+    }
+    const c = new Vector3((minX + maxX) * 0.5, (minY + maxY) * 0.5, (minZ + maxZ) * 0.5);
+    const sizeX = Math.max(1e-6, maxX - minX);
+    const sizeY = Math.max(1e-6, maxY - minY);
+    // Frame using camera FOV and viewport aspect
+    const ctrl = controlsRef.current;
+    const cam = ctrl.object;
+    const vFov = (cam.fov ?? 60) * Math.PI / 180;
+    const aspect = (typeof window !== "undefined" && window.innerHeight > 0)
+      ? (window.innerWidth / window.innerHeight)
+      : 1.6;
+    const halfW = sizeX * 0.5;
+    const halfH = sizeY * 0.5;
+    const distY = halfH / Math.tan(vFov / 2);
+    const distX = halfW / (Math.tan(vFov / 2) * aspect);
+    const margin = 1.6; // gentle padding
+    const desiredDist = Math.max(distX, distY) * margin;
+
+    ctrl.target.copy(c);
+    const dir = cam.position.clone().sub(ctrl.target).normalize();
+    if (!Number.isFinite(dir.x) || !Number.isFinite(dir.y) || !Number.isFinite(dir.z) || dir.lengthSq() < 1e-6) {
+      dir.set(0, 0, 1);
+    }
+    cam.position.copy(c.clone().add(dir.multiplyScalar(desiredDist)));
+    cam.updateProjectionMatrix?.();
+    ctrl.update();
+    lastSceneRef.current = scene;
+  }, [scene, loading]);
 
   return (
     <div style={{ display: 'flex', height: '100%', flex: 1 }}>
@@ -238,28 +251,32 @@ export function MoleculeView() {
         <color attach="background" args={[common.background]} />
         <ambientLight intensity={1.0} />
         <directionalLight position={[5, 10, 5]} intensity={1.0} />
-        <OrbitControls enableDamping dampingFactor={0.1} makeDefault />
+        <OrbitControls
+          ref={(ctrl) => {
+            // ctrl is OrbitControls from drei; store minimal fields we use
+            if (ctrl) controlsRef.current = ctrl as unknown as ControlsRef;
+          }}
+          enableDamping
+          dampingFactor={0.1}
+          makeDefault
+        />
         <AdaptiveDpr pixelated />
         <Preload all />
         <Suspense fallback={null}>
-          <Bounds fit clip margin={1.0}>
-            <group ref={contentRef}>
-              {common.representation !== "spheres" && cartoon && (
-                <>
-                  <primitive object={cartoon} />
-                  {overlays.bonds && objects.bonds && <primitive object={objects.bonds} />}
-                  {overlays.backbone && objects.backbone && <primitive object={objects.backbone} />}
-                </>
-              )}
-              {common.representation === "spheres" && (
-                <>
-                  {objects.atoms && <primitive object={objects.atoms} />}
-                  {objects.bonds && <primitive object={objects.bonds} />}
-                  {objects.backbone && <primitive object={objects.backbone} />}
-                </>
-              )}
-            </group>
-          </Bounds>
+          {common.representation !== "spheres" && ribbonGroup && (
+            <>
+              <primitive object={ribbonGroup} />
+              {overlays.bonds && objects.bonds && <primitive object={objects.bonds} />}
+              {overlays.backbone && objects.backbone && <primitive object={objects.backbone} />}
+            </>
+          )}
+          {common.representation === "spheres" && (
+            <>
+              {objects.atoms && <primitive object={objects.atoms} />}
+              {objects.bonds && <primitive object={objects.bonds} />}
+              {objects.backbone && <primitive object={objects.backbone} />}
+            </>
+          )}
         </Suspense>
       </Canvas>
       {loading && (
